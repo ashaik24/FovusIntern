@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: 2010-09-09  
+Resources:
+    IAMRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            RoleName: 
+                Ref: FovusIAMRoleName
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service:
+                            - lambda.amazonaws.com
+                      Action:
+                        - 'sts:AssumeRole'
+            Path: /
+            Policies:
+                - PolicyName: AWSLambda-S3-Dynamo
+                  PolicyDocument:
+                    Version: 2012-10-17
+                    Statement:
+                        - Effect: Allow
+                          Action:
+                            - 'lambda:InvokeFunction'
+                          Resource: '*'
+                        - Effect: Allow
+                          Action:
+                            - 'dynamodb:PutItem'
+                            - 'dynamodb:Scan'
+                          Resource: '*'
+                        - Effect: Allow
+                          Action:
+                             - 's3:PutObject'
+                             - 's3:GetObject'
+                          Resource: '*'
+    FovusFileUploadFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties: 
+            Code:
+                ZipFile: |
+                    var AWS = require('aws-sdk');
+                    const s3bucket = new AWS.S3();
+                    const dynamoDb = new AWS.DynamoDB();
+                    
+                    const S3_BUCKET_NAME = "fovus-intern-bucket";
+                    const DYNAMODB_TABLE_NAME = "fovus-input-table";
+                    const DYNAMODB_OUTPUT_TABLE = "fovus-output-table";
+                    var DYNAMODB_FINAL_TABLE='';
+                    const main = async (event, context)=>{
+                      try {
+                      
+                      var inputText = event.inputText;
+                      var fileName = event.fileName;
+                      
+                      let base64String = event.fileData.toString();
+                      let buffer = Buffer.from(base64String);
+                      
+                      var responseBody = await uploadFileToS3Bucket(inputText,fileName,buffer);
+                      const response = {
+                            statusCode: 200,
+                            statusText: responseBody,
+                      };
+                      return response;
+                        
+                      } catch (e) {
+                        console.log(e);
+                      }
+                     
+                    };
+                    const updateDynamodbTable = async(inputText,inputFilePath)=>{
+                      return await new Promise(async (resolve,reject)=>
+                      {  
+                        var existingParams={};
+                        
+                        existingParams.Select= "COUNT";
+                        DYNAMODB_FINAL_TABLE = inputText == null ? DYNAMODB_OUTPUT_TABLE:DYNAMODB_TABLE_NAME;
+                        existingParams.TableName = DYNAMODB_FINAL_TABLE;
+                        if(inputText!=null)
+                        {
+                          existingParams.ConditionalOperator="OR";
+                          existingParams.ScanFilter = {
+                             "input_file_path":{
+                                  "AttributeValueList":[ {"S":inputFilePath} ],
+                                  "ComparisonOperator": "EQ"
+                              },
+                               "input_text":{
+                                  "AttributeValueList":[ {"S":inputText} ],
+                                  "ComparisonOperator": "EQ"
+                              }
+                          };
+                          
+                        }
+                        else{
+                          existingParams.ScanFilter = {
+                             "output_file_path":{
+                                  "AttributeValueList":[ {"S":inputFilePath} ],
+                                  "ComparisonOperator": "EQ"
+                              }
+                          };
+                        }
+                        
+                        await dynamoDb.scan(existingParams,
+                        async (err,data)=>{
+                          if(err) resolve("Failed while checking duplicates"+err.toString());
+                          else
+                          {
+                            if(data.Count == 0)
+                            {
+                              var params ={
+                                TableName: DYNAMODB_FINAL_TABLE,
+                                Select:"COUNT",
+                              };
+                              await dynamoDb.scan(params, async (err, data)=>{ 
+                                if (err) {
+                                   resolve("Failed while scanning.");
+                                  } else {
+                                    var item = {
+                                      'id':{'S':(data.Count + 1).toString()},
+                                      };
+                                    if(inputText != null)
+                                    {
+                                       item.input_text = {'S':inputText};
+                                       item.input_file_path={'S':inputFilePath}
+                                    }
+                                    else
+                                    {
+                                      item.output_file_path={'S':inputFilePath}
+                                    }
+                                    var params = {
+                                      'TableName':DYNAMODB_FINAL_TABLE,
+                                      'Item':item
+                                      };
+                                    await dynamoDb.putItem(params, async (err,results)=>{
+                                      if(err) resolve("Failed while adding data to dynamoDb"+err.toString());
+                                      else resolve("Successfully uploaded");
+                                      });
+                                  }
+                              });
+                            }
+                            else
+                            {
+                              resolve("File already exists");
+                            }
+                          }
+                        });
+                       
+                    });
+                    };
+
+                    const uploadFileToS3Bucket = async (inputText,fileName,fileData)=>{
+                        return await new Promise(async (resolve,report)=>
+                        {
+                          const params = 
+                          {
+                            Bucket: S3_BUCKET_NAME,
+                            Key: fileName,
+                            Body: fileData
+                          };
+                          
+                          await s3bucket.upload(params, async (err,data)=>{
+                            if(err) resolve("Failed to upload file to S3");
+                            else
+                            {
+                              resolve(await updateDynamodbTable(inputText,data.Location));
+                            }
+                          });
+                        });
+                       
+                    };
+                    exports.handler = main;
+                
+            FunctionName:
+                Ref: FovusFileUploadLambdaFuncName
+            Handler: index.handler
+            Runtime: nodejs14.x
+            Role: !GetAtt IAMRole.Arn
+    FovusFileDownloadFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties:
+            Code:
+                ZipFile: |
+                
+                    const AWS = require('aws-sdk');
+                    const S3_BUCKET_NAME = "fovus-intern-bucket";
+
+                    const s3bucket = new AWS.S3();
+
+                    const lambda = new AWS.Lambda();
+                    const dynamoDb = new AWS.DynamoDB();
+                    const DYNAMODB_TABLE_NAME = "fovus-input-table";
+
+                    const main = async () =>
+                    {
+                      try
+                      {
+                        var response = await generateOutputFiles();
+                        return response;
+                      }
+                      catch(e)
+                      {
+                        
+                      }
+                    };
+
+                    const generateOutputFiles = async ()=>{
+                        return await new Promise(async (resolve,reject) =>
+                        {
+                            var params = {
+                                TableName: DYNAMODB_TABLE_NAME
+                            };
+                            
+                            var result = await dynamoDb.scan(params).promise();
+                            var responses = [];
+                            result.Items.forEach(async(element, index, array) =>{
+                                console.log('data',element.input_file_path.S);
+                                  
+                                 var urlList =  element.input_file_path.S.split("/")
+                                 var filename = urlList[urlList.length-1]
+                                
+                                 var fileObject = await readFile(S3_BUCKET_NAME,filename);
+                                 var bufferString = fileObject.toString();
+                                 if(bufferString.split(',').length > 1)
+                                    bufferString = bufferString.split(',')[1];
+                                 var buffer = Buffer.from(bufferString,'base64');
+                                 var outputText = buffer.toString().concat(" "+element.input_text.S);
+                                 console.log(outputText);
+                                 const response = {
+                                 inputText: null,
+                                 fileName: 'Output_'.concat(filename),
+                                 fileData: outputText
+                                  };
+                                 const invokeParams = {
+                                    FunctionName : 'fovus-file-upload',
+                                    InvocationType : 'RequestResponse',
+                                    LogType : 'Tail',
+                                    Payload : JSON.stringify(response)
+                                  };
+                                  const invokeResponse = await lambda.invoke(invokeParams,(error,data)=>{
+                                      if(error) console.error(error);
+                                  }).promise();
+                                  responses.push(invokeResponse.Payload);
+                                  if(index == array.length - 1)
+                                    resolve(responses);
+
+                            });
+                        });
+                     
+                    };
+
+
+                        
+                    const readFile = async (bucket, key) => {
+                      const params = {
+                        Bucket: bucket,
+                        Key: key,
+                      };
+
+                      const response = await s3bucket.getObject(params,
+                                  function (error, data) {
+                                    if (error != null) {
+                                      console.log("Failed to retrieve an object: " + error);
+                                    }
+                                  }).promise();
+
+                      const { Body } = response; 
+
+                      return Body;
+                    };
+                    exports.handler = main;
+            FunctionName:
+                Ref: FovusFileDownloadLambdaFuncName
+            Handler: index.handler
+            Runtime: nodejs14.x
+            Role: !GetAtt IAMRole.Arn
+    FovusBucketPermission:
+        Type: 'AWS::Lambda::Permission'
+        Properties: 
+            Action: 'lambda:InvokeFunction'
+            FunctionName: !Ref FovusFileDownloadFunction
+            Principal: s3.amazonaws.com
+            SourceAccount: !Ref 'AWS::AccountId'
+            SourceArn: !Sub 'arn:aws:s3:::${FovusFileUploadS3BucketName}'
+    FovusS3BucketFileUpload:
+        Type: 'AWS::S3::Bucket'
+        Properties:
+            BucketName:
+                Ref: FovusFileUploadS3BucketName
+            NotificationConfiguration:
+                LambdaConfigurations:
+                    - Event : 's3:ObjectCreated:*'
+                      Function: !GetAtt FovusFileDownloadFunction.Arn
+        DependsOn:
+            - IAMRole
+            - FovusBucketPermission            
+    FovusDynamoInputTable:
+        Type: 'AWS::DynamoDB::Table'
+        Properties:
+            TableName:
+                Ref: FovusDynamoInputTableName
+            AttributeDefinitions:
+            - 
+                AttributeName: id
+                AttributeType: S
+            KeySchema:
+            - 
+                AttributeName: id
+                KeyType: HASH            
+            ProvisionedThroughput:
+                ReadCapacityUnits: 5
+                WriteCapacityUnits: 5
+        DependsOn:
+            - IAMRole
+    FovusDynamoOutputTable:
+        Type: 'AWS::DynamoDB::Table'
+        Properties:
+            TableName:
+                Ref: FovusDynamoOutputTableName
+            AttributeDefinitions:
+            - 
+                AttributeName: id
+                AttributeType: S
+            KeySchema:
+            - 
+                AttributeName: id
+                KeyType: HASH              
+            ProvisionedThroughput:
+                ReadCapacityUnits: 5
+                WriteCapacityUnits: 5
+        DependsOn:
+            - IAMRole
+    FovusRestAPI:
+        Type: 'AWS::ApiGateway::RestApi'
+        Properties:
+            Name:
+                Ref: APIName
+        DependsOn:
+            - FovusFileUploadFunction    
+    FovusRestAPIResource:
+        Type: 'AWS::ApiGateway::Resource'
+        Properties:
+            RestApiId: !Ref FovusRestAPI
+            ParentId: !GetAtt
+                - FovusRestAPI
+                - RootResourceId
+            PathPart:
+                Ref: FovusFileUploadLambdaFuncName
+        DependsOn:
+            - FovusRestAPI   
+    FovusRestAPIPostMethod:
+        Type: 'AWS::ApiGateway::Method'
+        Properties:
+            RestApiId: !Ref FovusRestAPI
+            ResourceId: !Ref FovusRestAPIResource
+            HttpMethod: POST
+            AuthorizationType: NONE
+            MethodResponses:
+                - StatusCode: 200
+            Integration:
+                Type: AWS
+                IntegrationResponses:
+                    - StatusCode: 200
+                IntegrationHttpMethod: POST
+                Uri: !Sub
+                    - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFileUploadFunctionNameArn}/invocations'
+                    - LambdaFileUploadFunctionNameArn: !GetAtt FovusFileUploadFunction.Arn
+        DependsOn:
+            - FovusRestAPIResource
+    FovusRestAPIDeployment:
+        Type: 'AWS::ApiGateway::Deployment'
+        Properties:
+            RestApiId: !Ref FovusRestAPI
+            StageName:
+                Ref: EnvironmentName
+        DependsOn:
+            - FovusRestAPIPostMethod    
+    FovusRestAPIPermission:
+        Type: 'AWS::Lambda::Permission'
+        Properties:
+            Action: 'lambda:InvokeFunction'
+            FunctionName: !GetAtt FovusFileUploadFunction.Arn
+            Principal: apigateway.amazonaws.com
+        DependsOn:
+            - FovusRestAPIDeployment
+Parameters:
+    FovusFileUploadLambdaFuncName:
+        Type: String
+        Default: fovus-file-upload
+    FovusFileDownloadLambdaFuncName:
+        Type: String
+        Default: fovus-file-download
+    FovusDynamoInputTableName:
+        Type: String
+        Default: fovus-input-table
+    FovusDynamoOutputTableName:
+        Type: String
+        Default: fovus-output-table
+    APIName:
+        Type: String
+        Default: fovus-intern-api
+    FovusFileUploadS3BucketName:
+        Type: String
+        Default: fovus-intern-bucket
+    EnvironmentName:
+        Type: String
+        Default: Prod
+    FovusIAMRoleName:
+        Type: String
+        Default: fovus-iam-role
+ 

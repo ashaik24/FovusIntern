@@ -1,0 +1,3 @@
+Testing Focus intern project demo. 
+
+This file will be uploaded to S3 bucket
