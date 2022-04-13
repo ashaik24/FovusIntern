@@ -18,7 +18,7 @@ async function onSubmit(){
             fileName: filename
           }
   
-          let response = await fetch('https://lpxzwc18i2.execute-api.us-east-2.amazonaws.com/Prod/fovus-file-upload', {                  
+          let response = await fetch('https://59395et375.execute-api.us-east-2.amazonaws.com/Prod/fovus-file-upload', {                  
                   method: 'POST', 
                   headers: {                      
                       'Content-Type': 'application/json'                    

@@ -53,8 +53,8 @@ Resources:
                       var inputText = event.inputText;
                       var fileName = event.fileName;
                       
-                      let base64String = event.fileData.toString();
-                      let buffer = Buffer.from(base64String);
+                      let base64String = event.fileData;
+                      let buffer = Buffer.from(base64String,'base64');
                       
                       var responseBody = await uploadFileToS3Bucket(inputText,fileName,buffer);
                       const response = {
